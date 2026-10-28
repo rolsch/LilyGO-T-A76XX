@@ -4,67 +4,94 @@
  * @license   MIT
  * @copyright Copyright (c) 2025  ShenZhen XinYuan Electronic Technology Co., Ltd
  * @date      2025-03-25
- * @note      This demo uploads the location obtained by the device to a Traccar server
- *            using the [OsmAnd](https://www.traccar.org/osmand/) protocol.
- *            For more information about the OsmAnd protocol, please visit the official documentation.
- *            This demo only demonstrates uploading the location.
+ * @note      Robust vehicle tracking with the OsmAnd protocol (Traccar).
  *
+ *            Design goals (see plans/traccar-osmand-robust-store-and-forward.md):
+ *            - The board ALWAYS boots fully, even without SIM, without network,
+ *              without SD card. setup() contains no unbounded waits.
+ *            - GPS is started independently of the mobile network and fixes are
+ *              recorded continuously (store-and-forward).
+ *            - Every 60 seconds a transmission attempt is made. All network
+ *              operations are bounded by timeouts and never block the main loop.
+ *            - GPS fixes are buffered on the SD card (FAT32, gps.log) as
+ *              CRC-checked binary records with a persistent send offset
+ *              (gps.meta). Without an SD card a RAM ring buffer (128 records)
+ *              is used as fallback.
+ *            - On modem failure the modem is reset via the PWRKEY pulse
+ *              sequence (no esp_restart()), so buffered data is preserved.
+ *
+ *            OsmAnd protocol: https://www.traccar.org/osmand/
  *            Example server (Traccar demo server 3):
  *              Domain: demo3.traccar.org
- *              IP address: 188.245.151.94
  *              Port: 5055
  *              Device ID (Kennung): lilygo-01
  */
-#warning "SIM7600 has not been tested yet."
 #define TINY_GSM_RX_BUFFER          1024 // Set RX buffer to 1Kb
-
-// See all AT commands, if wanted
-// #define DUMP_AT_COMMANDS
 
 // If defined, cancel shallow sleep and use delay to replace shallow sleep
 // #define DEBUG_SKETCH
 
-// For external LED connection to observe status
-// #define EXT_LED_PIN     32
+// ------------------------- Timing / robustness -----------------------------
+#define REPORT_LOCATION_RATE_SECOND   60      // transmission attempt every 60 s
+#define GPS_POLL_INTERVAL_MS          1000    // GPS poll period
+#define SEND_BUDGET_MS                30000   // max send time per 60 s cycle
+#define MODEM_TEST_TIMEOUT_MS         2000    // modem liveness check timeout
+#define MODEM_BOOT_RETRIES            30      // max AT wait at boot (30 s)
+#define GPS_ENABLE_RETRIES            10      // max GPS enable retries (5 s)
+#define RECOVERY_COOLDOWN_MS          60000   // min interval between modem resets
 
-#define REPORT_LOCATION_RATE_SECOND     20
+// ------------------------------ Buffering ----------------------------------
+#define RAM_RING_SLOTS                128     // RAM fallback buffer size
+#define COMPACT_MIN_SIZE              65536   // compact only files >= 64 KB
 
 #include "utilities.h"
 #include <TinyGsmClient.h>
+#include <SD.h>
+
 #ifndef MODEM_DTR_PIN
 #error "This board does not support modem sleep function"
 #endif
 
-#ifdef DUMP_AT_COMMANDS  // if enabled it requires the streamDebugger lib
-#include <StreamDebugger.h>
-StreamDebugger debugger(SerialAT, Serial);
-TinyGsm modem(debugger);
-#else
 TinyGsm modem(SerialAT);
-#endif
 
-// It depends on the operator whether to set up an APN. If some operators do not set up an APN,
-// they will be rejected when registering for the network. You need to ask the local operator for the specific APN.
-// APNs from other operators are welcome to submit PRs for filling.
+// OsmAnd protocol: device ID (Kennung) and server URL.
+// Example values point to the Traccar demo server 3 (see README.MD).
+const char *client_id = "lilygo-01";
+const char *request_url = "http://demo3.traccar.org:5055/";
+// OsmAnd protocol post format:
+// http://demo.traccar.org:5055/?deviceid=12345&lat=48.8566&lon=2.3522&speed=15&altitude=35&batt=75
+const char *post_format = "deviceid=%s&lat=%.7f&lon=%.7f&speed=%.2f&altitude=%.2f&batt=%u";
+
+// It depends on the operator whether to set up an APN.
 //#define NETWORK_APN     "ctlte"             //ctlte: China Telecom
-
-// When using an IPv6 access point, the correct IPv6 APN must be configured.
-bool use_ipv6_access_point = false; // Whether to use IPv6 to set the access point
 
 #ifdef NETWORK_APN
 String apn = NETWORK_APN;
 #else
 String apn = "";
 #endif
+bool use_ipv6_access_point = false; // Whether to use IPv6 to set the access point
 
-String modemName = "UNKNOWN";
-// OsmAnd protocol: device ID (Kennung) and server URL.
-// Example values point to the Traccar demo server 3 (see README.MD).
-const char *client_id = "lilygo-01";
-const char *request_url = "http://demo3.traccar.org:5055/";
-// OsmAnd protocol post format:
-// http://demo.traccar.org:5055/?deviceid=12345&lat=48.8566&lon=2.3522&timestamp=2021-01-01T00:00:00Z&speed=15&bearing=270&altitude=35&accuracy=10&hdop=0.8&batt=75
-const char *post_format = "deviceid=%s&lat=%.7f&lon=%.7f&speed=%.2f&altitude=%.2f&batt=%u";
+// SD card files
+#define GPS_LOG_PATH   "/gps.log"
+#define GPS_LOG_TMP    "/gps.tmp"
+#define GPS_META_PATH  "/gps.meta"
+#define GPS_META_TMP   "/gps.meta.tmp"
+
+// Record layout (39 bytes total):
+//   [2 B magic 'GP'][2 B payload len LE][33 B payload][2 B CRC16-CCITT over payload]
+// Payload (33 bytes, little endian):
+//   [4 B unix time][4 B batt %][1 B flags (bit0: valid fix)]
+//   [8 B lat E7][8 B lon E7][2 B speed x100][2 B alt dm (signed)]
+//   [2 B HDOP x10][2 B satellite count]
+#define REC_MAGIC0      'G'
+#define REC_MAGIC1      'P'
+#define PAYLOAD_LEN     33
+#define RECORD_LEN      (2 + 2 + PAYLOAD_LEN + 2)
+
+// ---------------------------------------------------------------------------
+// Generic helpers
+// ---------------------------------------------------------------------------
 
 void light_sleep_delay(uint32_t ms)
 {
@@ -76,166 +103,404 @@ void light_sleep_delay(uint32_t ms)
 #endif
 }
 
-bool post_location(GPSInfo &info)
+uint16_t crc16_ccitt(const uint8_t *data, size_t len)
 {
-    // Initialize HTTP (the OsmAnd demo server speaks plain HTTP on port 5055)
-    modem.http_begin();
+    uint16_t crc = 0xFFFF;
+    for (size_t i = 0; i < len; i++) {
+        crc ^= (uint16_t)((uint16_t)data[i] << 8);
+        for (int b = 0; b < 8; b++) {
+            crc = (crc & 0x8000) ? (uint16_t)((crc << 1) ^ 0x1021) : (uint16_t)(crc << 1);
+        }
+    }
+    return crc;
+}
 
-    char post_buffer[128];
+static void putU16(uint8_t *b, size_t o, uint16_t v)
+{
+    b[o] = (uint8_t)(v & 0xFF);
+    b[o + 1] = (uint8_t)(v >> 8);
+}
 
-    // Do not calculate the power consumption, fixed at 100%
-    uint8_t battery_percent = 100;
-    snprintf(post_buffer, sizeof(post_buffer), post_format, client_id, info.latitude, info.longitude, info.second, info.altitude, battery_percent);
+static void putU32(uint8_t *b, size_t o, uint32_t v)
+{
+    b[o] = (uint8_t)(v & 0xFF);
+    b[o + 1] = (uint8_t)((v >> 8) & 0xFF);
+    b[o + 2] = (uint8_t)((v >> 16) & 0xFF);
+    b[o + 3] = (uint8_t)((v >> 24) & 0xFF);
+}
 
-    Serial.print("Request url:");
-    Serial.println(request_url);
-    Serial.print("Post body  :");
-    Serial.println(post_buffer);
+static void putI64(uint8_t *b, size_t o, int64_t v)
+{
+    for (int i = 0; i < 8; i++) {
+        b[o + i] = (uint8_t)((v >> (8 * i)) & 0xFF);
+    }
+}
 
-    // Set Post URL
-    if (!modem.http_set_url(request_url)) {
-        Serial.println("Failed to set the URL. Please check the validity of the URL!");
+static uint16_t getU16(const uint8_t *b, size_t o)
+{
+    return (uint16_t)(b[o] | ((uint16_t)b[o + 1] << 8));
+}
+
+static uint32_t getU32(const uint8_t *b, size_t o)
+{
+    return (uint32_t)b[o] | ((uint32_t)b[o + 1] << 8) | ((uint32_t)b[o + 2] << 16) | ((uint32_t)b[o + 3] << 24);
+}
+
+static int64_t getI64(const uint8_t *b, size_t o)
+{
+    int64_t v = 0;
+    for (int i = 7; i >= 0; i--) {
+        v = (v << 8) | b[o + i];
+    }
+    return v;
+}
+
+// GPS civil time (UTC) -> Unix time
+static uint32_t gpsToUnix(uint16_t year, uint8_t month, uint8_t day, uint8_t hour, uint8_t minute, uint8_t second)
+{
+    if (year < 2000) {
+        year = (uint16_t)(year + 2000);
+    }
+    int y = (int)year - (month <= 2 ? 1 : 0);
+    int era = (y >= 0 ? y : y - 399) / 400;
+    int yoe = y - era * 400;
+    int doy = (153 * (month + (month > 2 ? -3 : 9)) + 2) / 5 + (int)day - 1;
+    int doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    int64_t days = (int64_t)era * 146097 + doe - 719468;
+    return (uint32_t)(days * 86400LL + (int64_t)hour * 3600LL + (int64_t)minute * 60LL + second);
+}
+
+// ---------------------------------------------------------------------------
+// Record pack / unpack
+// ---------------------------------------------------------------------------
+
+static void buildRecord(const uint8_t payload[PAYLOAD_LEN], uint8_t out[RECORD_LEN])
+{
+    out[0] = REC_MAGIC0;
+    out[1] = REC_MAGIC1;
+    out[2] = (uint8_t)(PAYLOAD_LEN & 0xFF);
+    out[3] = (uint8_t)(PAYLOAD_LEN >> 8);
+    memcpy(&out[4], payload, PAYLOAD_LEN);
+    uint16_t crc = crc16_ccitt(payload, PAYLOAD_LEN);
+    out[4 + PAYLOAD_LEN] = (uint8_t)(crc & 0xFF);
+    out[5 + PAYLOAD_LEN] = (uint8_t)(crc >> 8);
+}
+
+static bool recordValid(const uint8_t rec[RECORD_LEN])
+{
+    if (rec[0] != REC_MAGIC0 || rec[1] != REC_MAGIC1) {
         return false;
     }
-    modem.http_set_user_agent("TinyGSM/LilyGo-A76XX");
-    int httpCode = modem.http_post(post_buffer);
-    if (httpCode != 200) {
-        Serial.print("HTTP post failed! error code = ");
-        Serial.println(httpCode);
-        modem.http_end();
+    if (rec[2] != (uint8_t)(PAYLOAD_LEN & 0xFF) || rec[3] != 0) {
         return false;
     }
+    uint16_t crc = crc16_ccitt(&rec[4], PAYLOAD_LEN);
+    return (crc & 0xFF) == rec[4 + PAYLOAD_LEN] && (crc >> 8) == rec[5 + PAYLOAD_LEN];
+}
 
-    modem.http_end();
+static void packPayload(const GPSInfo &info, uint32_t unixTime, uint8_t out[PAYLOAD_LEN])
+{
+    size_t o = 0;
+    putU32(out, o, unixTime);
+    o += 4;
+    putU32(out, o, 100); // battery percent (fixed, as in the original demo)
+    o += 4;
+    out[o++] = 0x01; // flags: bit0 = valid fix
+    putI64(out, o, (int64_t)lround(info.latitude * 1e7));
+    o += 8;
+    putI64(out, o, (int64_t)lround(info.longitude * 1e7));
+    o += 8;
+    putU16(out, o, (uint16_t)constrain((long)(info.speed * 100.0f + 0.5f), 0, 65535));
+    o += 2;
+    putU16(out, o, (uint16_t)(uint16_t)constrain((long)(info.altitude * 10.0f + 0.5f), -32768, 32767));
+    o += 2;
+    putU16(out, o, (uint16_t)constrain((long)(info.HDOP * 10.0f + 0.5f), 0, 65535));
+    o += 2;
+    uint16_t sats = (uint16_t)(info.gps_satellite_num + info.beidou_satellite_num
+                               + info.glonass_satellite_num + info.galileo_satellite_num);
+    putU16(out, o, sats);
+}
+
+// ---------------------------------------------------------------------------
+// Buffer: SD card (primary) + RAM ring (fallback)
+// ---------------------------------------------------------------------------
+
+static bool sdActive = false;
+static uint32_t sendOffset = 0; // byte offset of the next unsent record in gps.log
+static int sdFailCount = 0;
+
+// RAM ring buffer (fallback without SD card)
+static uint8_t ramRing[RAM_RING_SLOTS][RECORD_LEN];
+static uint16_t ramHead = 0; // index of oldest record
+static uint16_t ramCount = 0;
+
+static void metaSave()
+{
+    if (!sdActive) {
+        return;
+    }
+    uint8_t m[12];
+    m[0] = 'G';
+    m[1] = 'M';
+    m[2] = (uint8_t)(sendOffset & 0xFF);
+    m[3] = (uint8_t)((sendOffset >> 8) & 0xFF);
+    m[4] = (uint8_t)((sendOffset >> 16) & 0xFF);
+    m[5] = (uint8_t)((sendOffset >> 24) & 0xFF);
+    m[6] = 0;
+    m[7] = 0;
+    m[8] = 0;
+    m[9] = 0;
+    uint16_t crc = crc16_ccitt(m, 10);
+    m[10] = (uint8_t)(crc & 0xFF);
+    m[11] = (uint8_t)(crc >> 8);
+
+    File f = SD.open(GPS_META_TMP, FILE_WRITE);
+    if (!f) {
+        return;
+    }
+    f.write(m, 12);
+    f.close();
+    SD.remove(GPS_META_PATH);
+    SD.rename(GPS_META_TMP, GPS_META_PATH);
+}
+
+static void metaLoad()
+{
+    sendOffset = 0;
+    File f = SD.open(GPS_META_PATH, FILE_READ);
+    if (f) {
+        uint8_t m[12];
+        if (f.read(m, 12) == 12) {
+            uint16_t crc = crc16_ccitt(m, 10);
+            if (m[0] == 'G' && m[1] == 'M' && (crc & 0xFF) == m[10] && (crc >> 8) == m[11]) {
+                sendOffset = getU32(m, 2);
+            }
+        }
+        f.close();
+    }
+    // Clamp offset to the actual log size (protects against partial writes)
+    File log = SD.open(GPS_LOG_PATH, FILE_READ);
+    if (log) {
+        if (sendOffset > log.size()) {
+            sendOffset = 0;
+        }
+        log.close();
+    } else {
+        sendOffset = 0;
+    }
+    Serial.printf("Meta loaded: sendOffset=%lu\n", (unsigned long)sendOffset);
+}
+
+static void sdFailure()
+{
+    sdFailCount++;
+    Serial.printf("SD write failure (%d)\n", sdFailCount);
+    if (sdFailCount >= 3) {
+        sdActive = false;
+        Serial.println("SD disabled, falling back to RAM buffer");
+        return;
+    }
+    // Try to re-initialize the SD card
+    SD.end();
+    delay(100);
+    if (SD.begin(BOARD_SD_CS_PIN)) {
+        sdFailCount = 0;
+        Serial.println("SD re-initialized");
+    } else {
+        sdActive = false;
+        Serial.println("SD re-init failed, falling back to RAM buffer");
+    }
+}
+
+static bool bufferAppendRam(const uint8_t payload[PAYLOAD_LEN])
+{
+    uint8_t rec[RECORD_LEN];
+    buildRecord(payload, rec);
+    if (ramCount == RAM_RING_SLOTS) {
+        // Buffer full: drop the oldest record (worst case without SD card)
+        ramHead = (uint16_t)((ramHead + 1) % RAM_RING_SLOTS);
+        ramCount--;
+    }
+    uint16_t tail = (uint16_t)((ramHead + ramCount) % RAM_RING_SLOTS);
+    memcpy(ramRing[tail], rec, RECORD_LEN);
+    ramCount++;
     return true;
 }
 
-bool loopGPS(GPSInfo &info)
+static bool bufferAppend(const uint8_t payload[PAYLOAD_LEN])
 {
-    bool rlst = modem.getGPS_Ex(info);
-
-    if (rlst) {
-        Serial.println();
-        Serial.print("FixMode:");
-        Serial.println(info.isFix);
-        Serial.print("Latitude:");
-        Serial.println(info.latitude, 6);
-        Serial.print("Longitude:");
-        Serial.println(info.longitude, 6);
-        Serial.print("Speed:");
-        Serial.println(info.speed);
-        Serial.print("Altitude:");
-        Serial.println(info.altitude);
-        Serial.println("Visible Satellites:");
-        Serial.print(" GPS Satellites:");
-        Serial.println(info.gps_satellite_num);
-        Serial.print(" BEIDOU Satellites:");
-        Serial.println(info.beidou_satellite_num);
-        Serial.print(" GLONASS Satellites:");
-        Serial.println(info.glonass_satellite_num);
-        Serial.print(" GALILEO Satellites:");
-        Serial.println(info.galileo_satellite_num);
-        Serial.println("Date Time:");
-        Serial.print("Year:");
-        Serial.print(info.year);
-        Serial.print(" Month:");
-        Serial.print(info.month);
-        Serial.print(" Day:");
-        Serial.println(info.day);
-        Serial.print("Hour:");
-        Serial.print(info.hour);
-        Serial.print(" Minute:");
-        Serial.print(info.minute);
-        Serial.print(" Second:");
-        Serial.println(info.second);
-        Serial.print("Course:");
-        Serial.println(info.course);
-        Serial.print("PDOP:");
-        Serial.println(info.PDOP);
-        Serial.print("HDOP:");
-        Serial.println(info.HDOP);
-        Serial.print("VDOP:");
-        Serial.println(info.VDOP);
-        String gps_raw = modem.getGPSraw();
-        Serial.print("GPS/GNSS Based Location String:");
-        Serial.println(gps_raw);
+    if (sdActive) {
+        File f = SD.open(GPS_LOG_PATH, FILE_WRITE);
+        if (f) {
+            uint8_t rec[RECORD_LEN];
+            buildRecord(payload, rec);
+            bool ok = (f.write(rec, RECORD_LEN) == RECORD_LEN);
+            f.close();
+            if (ok) {
+                return true;
+            }
+            sdFailure();
+        } else {
+            sdFailure();
+        }
     }
-    return rlst;
+    return bufferAppendRam(payload);
 }
 
-void modem_enter_sleep(uint32_t ms)
+// Peek the next unsent record WITHOUT consuming it.
+static bool bufferPeekNext(uint8_t *outRec)
 {
-    Serial.printf("Enter modem sleep mode, will wake up in %u seconds\n", ms / 1000);
-
-#ifdef BOARD_LED_PIN
-    digitalWrite(BOARD_LED_PIN, LOW);
-#endif
-    // Pull up DTR to put the modem into sleep
-    pinMode(MODEM_DTR_PIN, OUTPUT);
-    digitalWrite(MODEM_DTR_PIN, HIGH);
-
-    if (!modem.sleepEnable(true)) {
-        Serial.println("modem sleep failed!");
-    } else {
-        Serial.println("Modem enter sleep modem successes!");
+    if (sdActive) {
+        for (int guard = 0; guard < 1024; guard++) {
+            File f = SD.open(GPS_LOG_PATH, FILE_READ);
+            if (!f) {
+                return false;
+            }
+            if (f.size() <= sendOffset) {
+                f.close();
+                return false;
+            }
+            bool ok = false;
+            if (f.seek(sendOffset)) {
+                uint8_t rec[RECORD_LEN];
+                if (f.read(rec, RECORD_LEN) == (int)RECORD_LEN && recordValid(rec)) {
+                    memcpy(outRec, rec, RECORD_LEN);
+                    ok = true;
+                }
+            }
+            f.close();
+            if (ok) {
+                return true;
+            }
+            // Corrupted record: skip it
+            sendOffset += RECORD_LEN;
+            metaSave();
+        }
+        return false;
     }
+    if (ramCount == 0) {
+        return false;
+    }
+    memcpy(outRec, ramRing[ramHead], RECORD_LEN);
+    return true;
+}
 
-    // debug
-#if 0
-    Serial.println("Check modem response.");
-    while (modem.testAT()) {
-        Serial.print(".");
+// Consume the record that was just sent successfully.
+static void bufferMarkSent()
+{
+    if (sdActive) {
+        sendOffset += RECORD_LEN;
+        metaSave();
+    } else {
+        ramHead = (uint16_t)((ramHead + 1) % RAM_RING_SLOTS);
+        ramCount--;
+    }
+}
+
+static bool bufferHasPending()
+{
+    if (sdActive) {
+        File f = SD.open(GPS_LOG_PATH, FILE_READ);
+        if (!f) {
+            return false;
+        }
+        bool pending = (f.size() > sendOffset);
+        f.close();
+        return pending;
+    }
+    return ramCount > 0;
+}
+
+// Compact gps.log once more than 50 % of it has been sent (limits SD wear).
+static void maybeCompact()
+{
+    if (!sdActive) {
+        return;
+    }
+    File probe = SD.open(GPS_LOG_PATH, FILE_READ);
+    if (!probe) {
+        return;
+    }
+    uint32_t size = probe.size();
+    probe.close();
+    if (size < COMPACT_MIN_SIZE) {
+        return;
+    }
+    if (sendOffset * 2 < size) {
+        return; // less than 50 % sent
+    }
+    Serial.printf("Compacting gps.log (%lu bytes, offset %lu)\n", (unsigned long)size, (unsigned long)sendOffset);
+
+    File src = SD.open(GPS_LOG_PATH, FILE_READ);
+    File dst = SD.open(GPS_LOG_TMP, FILE_WRITE);
+    if (!src || !dst) {
+        if (src) src.close();
+        if (dst) dst.close();
+        return;
+    }
+    if (src.seek(sendOffset)) {
+        uint8_t rec[RECORD_LEN];
+        while (src.available()) {
+            if (src.read(rec, RECORD_LEN) != (int)RECORD_LEN) {
+                break;
+            }
+            if (recordValid(rec)) {
+                dst.write(rec, RECORD_LEN);
+            }
+        }
+    }
+    src.close();
+    dst.close();
+    SD.remove(GPS_LOG_PATH);
+    SD.rename(GPS_LOG_TMP, GPS_LOG_PATH);
+    sendOffset = 0;
+    metaSave();
+    Serial.println("Compaction done");
+}
+
+// ---------------------------------------------------------------------------
+// Modem management (bounded, non-blocking)
+// ---------------------------------------------------------------------------
+
+static void pwrkeyPulse()
+{
+    pinMode(BOARD_PWRKEY_PIN, OUTPUT);
+    digitalWrite(BOARD_PWRKEY_PIN, LOW);
+    delay(100);
+    digitalWrite(BOARD_PWRKEY_PIN, HIGH);
+    delay(MODEM_POWERON_PULSE_WIDTH_MS);
+    digitalWrite(BOARD_PWRKEY_PIN, LOW);
+}
+
+static void enableGps()
+{
+    Serial.println("Enabling GPS/GNSS...");
+    bool ok = false;
+    for (int i = 0; i < GPS_ENABLE_RETRIES; i++) {
+        if (modem.enableGPS(MODEM_GPS_ENABLE_GPIO, MODEM_GPS_ENABLE_LEVEL)) {
+            ok = true;
+            break;
+        }
         delay(500);
     }
-    Serial.println("Modem is not response, modem has sleep!");
-
-    Serial.flush();
-
-    delay(100);
+    if (ok) {
+        Serial.println("GPS enabled");
+#if defined(TINY_GSM_MODEM_A7670) || defined(TINY_GSM_MODEM_A7608)
+        modem.setGPSMode(GNSS_MODE_GPS_BDS_GALILEO_SBAS_QZSS);
+#elif defined(TINY_GSM_MODEM_SIM7670G)
+        modem.setGPSMode(GNSS_MODE_GPS_GLONASS_GALILEO_BDS);
+#elif defined(TINY_GSM_MODEM_SIM7600)
+        modem.setGPSMode(GNSS_MODE_ALL);
+#elif defined(TINY_GSM_MODEM_SIM7000SSL) || defined(TINY_GSM_MODEM_SIM7000)
+        modem.setGPSMode(GNSS_MODE_ALL);
 #endif
-
-    light_sleep_delay(ms);
-
-    // Pull down DTR to wake up MODEM
-    pinMode(MODEM_DTR_PIN, OUTPUT);
-    digitalWrite(MODEM_DTR_PIN, LOW);
-
-#ifdef BOARD_LED_PIN
-    digitalWrite(BOARD_LED_PIN, HIGH);
-#endif
-
-    // Wait modem wakeup
-    light_sleep_delay(500);
+    } else {
+        Serial.println("WARNING: GPS enable failed, will retry in loop");
+    }
 }
 
-void setup()
+static void bootModem()
 {
-    Serial.begin(115200); // Set console baud rate
-    Serial.println("Start Sketch");
-
-#ifdef EXT_LED_PIN
-    pinMode(EXT_LED_PIN, OUTPUT);
-    digitalWrite(EXT_LED_PIN, HIGH);
-#endif
-
-#ifdef BOARD_LED_PIN
-    pinMode(BOARD_LED_PIN, OUTPUT);
-    digitalWrite(BOARD_LED_PIN, LOW);
-#endif
-
-    SerialAT.begin(115200, SERIAL_8N1, MODEM_RX_PIN, MODEM_TX_PIN);
-
-#ifdef BOARD_POWERON_PIN
-    /* Set Power control pin output
-    * @note      Known issues, ESP32 (V1.2) version of T-A7670, T-A7608,
-    *            when using battery power supply mode, BOARD_POWERON_PIN (IO12) must be set to high level after esp32 starts, otherwise a reset will occur.
-    * */
-    pinMode(BOARD_POWERON_PIN, OUTPUT);
-    digitalWrite(BOARD_POWERON_PIN, HIGH);
-    gpio_hold_en((gpio_num_t)BOARD_POWERON_PIN);
-    gpio_deep_sleep_hold_en();
-#endif
-
     // Set modem reset pin, reset modem
 #ifdef MODEM_RESET_PIN
     pinMode(MODEM_RESET_PIN, OUTPUT);
@@ -248,260 +513,238 @@ void setup()
     gpio_deep_sleep_hold_en();
 #endif
 
-#ifdef MODEM_FLIGHT_PIN
-    // If there is an airplane mode control, you need to exit airplane mode
-    pinMode(MODEM_FLIGHT_PIN, OUTPUT);
-    digitalWrite(MODEM_FLIGHT_PIN, HIGH);
-#endif
-
     // Pull down DTR to ensure the modem is not in sleep state
     pinMode(MODEM_DTR_PIN, OUTPUT);
     digitalWrite(MODEM_DTR_PIN, LOW);
 
-    // Turn on the modem
-    pinMode(BOARD_PWRKEY_PIN, OUTPUT);
-    digitalWrite(BOARD_PWRKEY_PIN, LOW);
-    delay(100);
-    digitalWrite(BOARD_PWRKEY_PIN, HIGH);
-    delay(MODEM_POWERON_PULSE_WIDTH_MS);
-    digitalWrite(BOARD_PWRKEY_PIN, LOW);
+    // Turn on the modem (PWRKEY pulse sequence, see HARDWARE.md)
+    pwrkeyPulse();
 
-    // Check if the modem is online
-    Serial.println("Start modem...");
-
-    int retry = 0;
-    while (!modem.testAT(1000)) {
-        Serial.println(".");
-        if (retry++ > 30) {
-            digitalWrite(BOARD_PWRKEY_PIN, LOW);
-            delay(100);
-            digitalWrite(BOARD_PWRKEY_PIN, HIGH);
-            delay(MODEM_POWERON_PULSE_WIDTH_MS);
-            digitalWrite(BOARD_PWRKEY_PIN, LOW);
-            retry = 0;
+    Serial.println("Waiting for modem AT (max 30 s)...");
+    bool up = false;
+    for (int i = 0; i < MODEM_BOOT_RETRIES; i++) {
+        if (modem.testAT(1000)) {
+            up = true;
+            break;
         }
     }
-    Serial.println();
-
-    while (1) {
-        modemName = modem.getModemName();
-        if (modemName == "UNKNOWN") {
-            Serial.println("Unable to obtain module information normally, try again");
-            delay(1000);
-        } else if (modemName.startsWith("A7670E-FASE") || modemName.startsWith("A7670SA-FASE")) {
-            Serial.println("Modem support built-in GPS function, keep running");
-            break;
-        } else if (modemName.startsWith("A7670E-LNXY-UBL")
-                   || modemName.startsWith("A7670E-LNMV")
-                   || modemName.startsWith("A7670SA-LASE")
-                   || modemName.startsWith("A7670SA-LASC")
-                   || modemName.startsWith("A7670G-LLSE")
-                   || modemName.startsWith("A7670G-LABE")
-                   || modemName.startsWith("A7670E-LASE ")) {
-            while (1) {
-                Serial.println("The modem does not have built-in GPS function.");
-                delay(1000);
+    if (!up) {
+        Serial.println("Modem not responding, one PWRKEY re-pulse...");
+        pwrkeyPulse();
+        for (int i = 0; i < 10; i++) {
+            if (modem.testAT(1000)) {
+                up = true;
+                break;
             }
-        } else {
-            Serial.print("Model Name:");
-            Serial.println(modemName);
-            break;
         }
-        delay(5000);
     }
-
-    // Check if SIM card is online
-    SimStatus sim = SIM_ERROR;
-    while (sim != SIM_READY) {
-        sim = modem.getSimStatus();
-        switch (sim) {
-        case SIM_READY:
-            Serial.println("SIM card online");
-            break;
-        case SIM_LOCKED:
-            Serial.println("The SIM card is locked. Please unlock the SIM card first.");
-            // const char *SIMCARD_PIN_CODE = "123456";
-            // modem.simUnlock(SIMCARD_PIN_CODE);
-            break;
-        default:
-            break;
-        }
-        light_sleep_delay(1000);
+    if (up) {
+        String name = modem.getModemName();
+        Serial.print("Modem: ");
+        Serial.println(name);
+        enableGps();
+    } else {
+        Serial.println("WARNING: modem offline at boot, loop() will keep trying");
     }
+}
 
-#ifdef TINY_GSM_MODEM_HAS_NETWORK_MODE
-    if (!modem.setNetworkMode(MODEM_NETWORK_AUTO)) {
-        Serial.println("Set network mode failed!");
+static uint32_t lastRecoveryAttempt = 0;
+
+static void recoverModem()
+{
+    if (millis() - lastRecoveryAttempt < RECOVERY_COOLDOWN_MS) {
+        return; // avoid hammering the modem
     }
-    String mode = modem.getNetworkModeString();
-    Serial.print("Current network mode: ");
-    Serial.println(mode);
-#endif
-
-#ifdef TINY_GSM_MODEM_HAS_PREFERRED_MODE
-    if (!modem.setPreferredMode(MODEM_PREFERRED_CATM_NBIOT)) {
-        Serial.println("Set network preferred failed!");
-    }
-    String prefMode = modem.getPreferredModeString();
-    Serial.print("Current preferred mode: ");
-    Serial.println(prefMode);
-#endif
-
-#ifdef NETWORK_APN
-    Serial.printf("Set network apn: %s\n", NETWORK_APN);
-    if (!modem.setNetworkAPN(NETWORK_APN)) {
-        Serial.println("Set network apn error!");
-    }
-#endif
-
-    // Check network registration status and network signal status
-    int16_t sq;
-    Serial.print("Wait for the modem to register with the network.");
-    RegStatus status = REG_NO_RESULT;
-    while (status == REG_NO_RESULT || status == REG_SEARCHING || status == REG_UNREGISTERED) {
-        status = modem.getRegistrationStatus();
-        switch (status) {
-        case REG_UNREGISTERED:
-        case REG_SEARCHING:
-            sq = modem.getSignalQuality();
-            Serial.printf("[%lu] Signal Quality:%d\n", millis() / 1000, sq);
-            light_sleep_delay(1000);
-            break;
-        case REG_DENIED:
-            Serial.println("Network registration was rejected, please check if the APN is correct");
-            return;
-        case REG_OK_HOME:
-            Serial.println("Online registration successful");
-            break;
-        case REG_OK_ROAMING:
-            Serial.println("Network registration successful, currently in roaming mode");
-            break;
-        default:
-            Serial.printf("Registration Status:%d\n", status);
-            light_sleep_delay(1000);
+    lastRecoveryAttempt = millis();
+    Serial.println("Modem unresponsive - resetting via PWRKEY pulse");
+    pwrkeyPulse();
+    bool up = false;
+    for (int i = 0; i < MODEM_BOOT_RETRIES; i++) {
+        if (modem.testAT(1000)) {
+            up = true;
             break;
         }
     }
-    Serial.println();
-
-#ifdef MODEM_REG_SMS_ONLY
-    while (status == REG_SMS_ONLY) {
-        Serial.println("Registered for \"SMS only\", home network (applicable only when E-UTRAN), this type of registration cannot access the network. Please check the APN settings and ask the operator for the correct APN information and the balance and package of the SIM card. If you still cannot connect, please replace the SIM card and test again. Related ISSUE: https://github.com/Xinyuan-LilyGO/LilyGO-T-A76XX/issues/307#issuecomment-3034800353");
-        delay(5000);
+    if (up) {
+        enableGps();
+        Serial.println("Modem recovered");
+    } else {
+        Serial.println("Modem still offline, will retry next cycle");
     }
-#endif
+}
 
-    Serial.printf("Registration Status:%d\n", status);
-    light_sleep_delay(1000);
+// ---------------------------------------------------------------------------
+// GPS recording
+// ---------------------------------------------------------------------------
 
-    String ueInfo;
-    if (modem.getSystemInformation(ueInfo)) {
-        Serial.print("Inquiring UE system information:");
-        Serial.println(ueInfo);
+static bool hasLastFix = false;
+static uint32_t lastFixTime = 0;
+static int64_t lastFixLat = 0;
+static int64_t lastFixLon = 0;
+
+// Skip duplicate fixes (same second + same position) to avoid log spam.
+static bool isDuplicateFix(const GPSInfo &info)
+{
+    uint32_t t = gpsToUnix(info.year, info.month, info.day, info.hour, info.minute, info.second);
+    int64_t lat = (int64_t)lround(info.latitude * 1e7);
+    int64_t lon = (int64_t)lround(info.longitude * 1e7);
+    if (hasLastFix && t == lastFixTime && lat == lastFixLat && lon == lastFixLon) {
+        return true;
     }
+    hasLastFix = true;
+    lastFixTime = t;
+    lastFixLat = lat;
+    lastFixLon = lon;
+    return false;
+}
 
-    /**
-     *  Configure the network APN and specify whether to access the network using IPv6. If unsure, please consult your SIM card provider.
-     */
-    Serial.print("Connecting to network with APN:");
-    Serial.println(apn);
-    Serial.print("Use IPv6 access point:");
-    Serial.println(use_ipv6_access_point ? "true" : "false");
-    retry = 3;
-    while (retry--) {
-        if (modem.setNetworkActive(apn, use_ipv6_access_point)) {
-            break;
-        }
-        Serial.println("Enable network failed, retry after 3s...");
-        delay(3000);
-    }
-    if (retry < 0) {
-        Serial.println("Failed to enable network!");
+static void recordGps(const GPSInfo &info)
+{
+    uint32_t t = gpsToUnix(info.year, info.month, info.day, info.hour, info.minute, info.second);
+    uint8_t payload[PAYLOAD_LEN];
+    packPayload(info, t, payload);
+    bufferAppend(payload);
+    Serial.printf("Recorded fix: %.6f,%.6f speed=%.2f alt=%.1f sats=%u\n",
+                  info.latitude, info.longitude, info.speed, info.altitude,
+                  (unsigned)(info.gps_satellite_num + info.beidou_satellite_num
+                             + info.glonass_satellite_num + info.galileo_satellite_num));
+}
+
+// ---------------------------------------------------------------------------
+// Transmission (store-and-forward, bounded by SEND_BUDGET_MS)
+// ---------------------------------------------------------------------------
+
+static void sendCycle()
+{
+    // 1. Modem liveness (bounded)
+    if (!modem.testAT(MODEM_TEST_TIMEOUT_MS)) {
+        recoverModem();
         return;
     }
 
-    light_sleep_delay(5000);
-
-    String ipAddress = modem.getLocalIP();
-    Serial.print("Network IP:");
-    Serial.println(ipAddress);
-
-    modem.sendAT("+SIMCOMATI");
-    modem.waitResponse();
-    delay(2000);
-
-    Serial.println("Enabling GPS/GNSS/GLONASS");
-    while (!modem.enableGPS(MODEM_GPS_ENABLE_GPIO, MODEM_GPS_ENABLE_LEVEL)) {
-        Serial.print(".");
-        light_sleep_delay(500);
+    // 2. Network registration: only HOME/ROAMING can send data.
+    //    REG_SMS_ONLY (SIM7670G) means "no data network" -> stay buffered.
+    RegStatus st = modem.getRegistrationStatus();
+    if (st != REG_OK_HOME && st != REG_OK_ROAMING) {
+        Serial.printf("No data network (reg=%d), data stays buffered\n", (int)st);
+        return;
     }
-    Serial.println();
-    Serial.println("GPS Enabled");
 
-    // Set GPS Baud to 115200
-    modem.setGPSBaud(115200);
+    // 3. PDP context (max 2 attempts)
+    if (!modem.setNetworkActive(apn, use_ipv6_access_point)) {
+        delay(1000);
+        if (!modem.setNetworkActive(apn, use_ipv6_access_point)) {
+            Serial.println("PDP activation failed, retry next cycle");
+            return;
+        }
+    }
 
-#if defined(TINY_GSM_MODEM_A7670) || defined(TINY_GSM_MODEM_A7608)
-    modem.setGPSMode(GNSS_MODE_GPS_BDS_GALILEO_SBAS_QZSS);
-#elif defined(TINY_GSM_MODEM_SIM7670G)
-    modem.setGPSMode(GNSS_MODE_GPS_GLONASS_GALILEO_BDS);
-#elif defined(TINY_GSM_MODEM_SIM7600)
-    modem.setGPSMode(GNSS_MODE_ALL);
-#elif defined(TINY_GSM_MODEM_SIM7000SSL) || defined(TINY_GSM_MODEM_SIM7000)
-    modem.setGPSMode(GNSS_MODE_ALL);
+    // 4. Send all pending records within the time budget
+    if (!bufferHasPending()) {
+        return; // nothing to send
+    }
+
+    modem.https_begin();
+    modem.https_set_timeout(10, 10, 10); // conn=10s, recv=10s, resp=10s
+    if (!modem.https_set_url(request_url)) {
+        Serial.println("Failed to set the URL. Please check the validity of the URL!");
+        modem.https_end();
+        return;
+    }
+    modem.https_set_user_agent("TinyGSM/LilyGo-A76XX");
+
+    uint32_t start = millis();
+    int sent = 0;
+    while (millis() - start < SEND_BUDGET_MS) {
+        uint8_t rec[RECORD_LEN];
+        if (!bufferPeekNext(rec)) {
+            break; // all sent
+        }
+
+        // Unpack payload (payload starts at rec[4])
+        uint32_t batt = getU32(rec, 8);
+        int64_t latE7 = getI64(rec, 13);
+        int64_t lonE7 = getI64(rec, 21);
+        float lat = (float)latE7 / 1e7f;
+        float lon = (float)lonE7 / 1e7f;
+        float speed = (float)getU16(rec, 29) / 100.0f;
+        float alt = (float)(int16_t)getU16(rec, 31) / 10.0f;
+
+        char post_buffer[128];
+        snprintf(post_buffer, sizeof(post_buffer), post_format, client_id, lat, lon, speed, alt, batt);
+
+        int httpCode = modem.https_post(post_buffer);
+        if (httpCode == 200) {
+            bufferMarkSent();
+            sent++;
+        } else {
+            Serial.printf("HTTP post failed! error code = %d, record kept, retry next cycle\n", httpCode);
+            break;
+        }
+    }
+    modem.https_end();
+
+    if (sent > 0) {
+        Serial.printf("Sent %d buffered record(s)\n", sent);
+    }
+    maybeCompact();
+}
+
+// ---------------------------------------------------------------------------
+// setup / loop
+// ---------------------------------------------------------------------------
+
+static uint32_t lastSendAttempt = 0;
+
+void setup()
+{
+    Serial.begin(115200); // Set console baud rate
+    Serial.println("Start Sketch (robust store-and-forward)");
+
+#ifdef BOARD_LED_PIN
+    pinMode(BOARD_LED_PIN, OUTPUT);
+    digitalWrite(BOARD_LED_PIN, LOW);
 #endif
 
-#ifndef TINY_GSM_MODEM_SIM7670G
-    // GPS acceleration only supports A7670X/A7608X (excluding A7670G and other versions that do not support positioning).
-    // SIM7670G does not support GPS acceleration function
-    Serial.print("GPS acceleration is enabled");
-    if (!modem.enableAGPS()) {
-        Serial.println(" failed!");
+    // SD card (optional - RAM ring buffer is the fallback)
+    if (SD.begin(BOARD_SD_CS_PIN)) {
+        sdActive = true;
+        metaLoad();
+        Serial.println("SD card active, buffering to gps.log");
     } else {
-        Serial.println(" success!");
+        sdActive = false;
+        Serial.printf("SD card not available, using RAM buffer (%d records)\n", RAM_RING_SLOTS);
     }
-#endif
+
+    // Modem power-on + bounded AT wait + bounded GPS enable.
+    // NOTE: no SIM/network wait here on purpose - the main loop must always start.
+    bootModem();
+
+    Serial.println("setup() done, entering main loop");
 }
 
 void loop()
 {
-    GPSInfo info;
-
-#ifdef EXT_LED_PIN
-    digitalWrite(EXT_LED_PIN, HIGH);
-#endif
-
-    // Check if the modem is responsive, otherwise reboot
-    bool isPowerOn = modem.testAT(3000);
-    if (!isPowerOn) {
-        Serial.println("Power off, restart device");
-        Serial.flush();
-        delay(100);
-        esp_restart();
-    }
-
-    bool rlst = loopGPS(info);
-
-#ifdef EXT_LED_PIN
-    digitalWrite(EXT_LED_PIN, LOW);
-#endif
-
-    if (!rlst) {
-        // If positioning is not successful, set ESP to enter light sleep mode to save power consumption
-        light_sleep_delay(15000);
-    } else {
-        rlst = post_location(info);
-        if (rlst) {
-            // If the positioning is successful and the location is sent successfully,
-            // the ESP and modem are set to sleep mode. The sleep mode consumes about 2~3mA
-            // For power consumption records, please see README
-            modem_enter_sleep(REPORT_LOCATION_RATE_SECOND * 1000);
-        } else {
-            // If the positioning is successful, if the sending of the position fails,
-            // set the ESP to sleep mode and wait for the next sending
-            light_sleep_delay(REPORT_LOCATION_RATE_SECOND * 1000);
+    // 1. Modem liveness + continuous GPS recording (independent of network)
+    if (modem.testAT(MODEM_TEST_TIMEOUT_MS)) {
+        GPSInfo info;
+        if (modem.getGPS_Ex(info) && info.isFix) {
+            if (!isDuplicateFix(info)) {
+                recordGps(info);
+            }
         }
+    } else {
+        recoverModem(); // bounded, with cooldown
     }
+
+    // 2. Transmission attempt every 60 s (even without new fixes)
+    if (millis() - lastSendAttempt >= (uint32_t)REPORT_LOCATION_RATE_SECOND * 1000UL) {
+        lastSendAttempt = millis();
+        sendCycle();
+    }
+
+    // 3. Sleep until the next poll (ESP light sleep, modem stays awake for GPS)
+    light_sleep_delay(GPS_POLL_INTERVAL_MS);
 }
 
 #ifndef TINY_GSM_FORK_LIBRARY

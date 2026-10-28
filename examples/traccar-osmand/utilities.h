@@ -30,7 +30,7 @@
 // #define LILYGO_T_CALL_A7670_V1_1
 
 // Products Link: https://lilygo.cc/products/t-sim-7670g-s3
-// #define LILYGO_T_SIM7670G_S3
+#define LILYGO_T_SIM7670G_S3
 
 // Products Link: https://lilygo.cc/products/t-a7608e-h?variant=42860532433077
 // #define LILYGO_T_A7608X
